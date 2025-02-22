@@ -2,7 +2,6 @@ package com.litongjava.translator;
 
 import com.litongjava.translator.consts.AudioConst;
 import com.litongjava.translator.utils.AudioUtils;
-
 import javafx.application.Application;
 import javafx.application.Platform;
 import javafx.geometry.Insets;
@@ -10,6 +9,7 @@ import javafx.scene.Scene;
 import javafx.scene.canvas.Canvas;
 import javafx.scene.canvas.GraphicsContext;
 import javafx.scene.control.Button;
+import javafx.scene.control.ComboBox;
 import javafx.scene.control.Label;
 import javafx.scene.control.Slider;
 import javafx.scene.control.TextArea;
@@ -42,7 +42,7 @@ public class MainUI extends Application {
     grid.add(translatedText, 1, 0);
 
     // 静音阈值设置
-    Slider thresholdSlider = new Slider(-40, 20, AudioConst.DEFAULT_SILENCE_THRESHOLD);
+    Slider thresholdSlider = new Slider(-60, 0, AudioConst.DEFAULT_SILENCE_THRESHOLD);
     thresholdSlider.setBlockIncrement(1);
     thresholdSlider.setMajorTickUnit(5);
     thresholdSlider.setMinorTickCount(4);
@@ -68,11 +68,31 @@ public class MainUI extends Application {
     HBox buttonBox = new HBox(10, startBtn, pauseBtn, stopBtn);
     grid.add(buttonBox, 1, 4);
 
+    // 模型选择下拉框
+    ComboBox<String> modelComboBox = new ComboBox<>();
+    modelComboBox.getItems().addAll("whisper-large-v3", "whisper-large-v3-turbo", "distil-whisper-large-v3-en");
+    modelComboBox.setValue("whisper-large-v3-turbo");
+    grid.add(new Label("选择模型:"), 0, 5);
+    grid.add(modelComboBox, 1, 5);
+
+    modelComboBox.valueProperty().addListener((obs, oldVal, newVal) -> {
+      AudioProcessor.selectedModel = newVal;
+    });
+
     Scene scene = new Scene(grid, 850, 500);
     primaryStage.setScene(scene);
     primaryStage.show();
 
-    // 初始化录音器
+    // 窗口关闭时退出程序
+    primaryStage.setOnCloseRequest(e -> {
+      if (audioRecorder != null && audioRecorder.isRunning()) {
+        audioRecorder.stopRecording();
+      }
+      Platform.exit();
+      System.exit(0);
+    });
+
+    // 初始化录音器，并传入 UI 更新回调
     audioRecorder = new AudioRecorder(this::handleAudioData);
     // 设置初始静音阈值
     audioRecorder.setSilenceThreshold(thresholdSlider.getValue());
@@ -82,7 +102,6 @@ public class MainUI extends Application {
 
     // 按钮事件处理
     startBtn.setOnAction(e -> {
-      // 如果录音器已经启动但处于暂停状态，则恢复录音；否则启动新的录音线程
       if (audioRecorder.isRunning() && audioRecorder.isPaused()) {
         audioRecorder.resumeRecording();
         statusLabel.setText("状态: 录音中");
@@ -108,7 +127,7 @@ public class MainUI extends Application {
   }
 
   /**
-   * 更新翻译文本（可供其他线程调用）
+   * 供 GroqSpeechClient 回调更新翻译文本（在 UI 线程中执行）
    */
   public static void updateUI(String translated) {
     Platform.runLater(() -> {
@@ -117,21 +136,17 @@ public class MainUI extends Application {
   }
 
   /**
-   * 从 AudioRecorder 回调的音频数据，更新UI线程中的状态和波形
+   * 处理从 AudioRecorder 回调的音频数据，更新波形和状态显示
    */
   private void handleAudioData(byte[] audioData) {
     Platform.runLater(() -> {
-      // 转换为 short 数组
       short[] samples = AudioUtils.convertBytesToShorts(audioData);
       if (samples.length == 0) {
         return;
       }
-
-      // 计算 RMS 并转换为 dB
       double rms = AudioUtils.calculateRMS(samples);
       double db = 20 * Math.log10(rms + 1e-12);
 
-      // 计算平均幅度 dB（可选，用于展示不同的音量测量方式）
       double sum = 0;
       for (short sample : samples) {
         sum += Math.abs(sample);
@@ -139,16 +154,11 @@ public class MainUI extends Application {
       double avg = sum / samples.length;
       double volumeDb = 20 * Math.log10(avg / 32768.0 + 1e-12);
 
-      // 获取当前静音阈值
       double threshold = audioRecorder.getSilenceThreshold();
-
-      // 根据阈值判断状态
       String curStatus = (db < threshold) ? "静音" : "录音中";
-      String statusText = String.format("状态: %s | RMS分贝: %.1f dB | 平均音量: %.1f dB | 阈值: %.1f dB", 
-                                         curStatus, db, volumeDb, threshold);
+      String statusText = String.format("状态: %s | RMS: %.1f dB | 平均音量: %.1f dB | 阈值: %.1f dB", curStatus, db, volumeDb, threshold);
       statusLabel.setText(statusText);
 
-      // 绘制波形
       drawWaveform(samples);
     });
   }
@@ -160,14 +170,11 @@ public class MainUI extends Application {
     double width = waveformCanvas.getWidth();
     double height = waveformCanvas.getHeight();
     double yCenter = height / 2;
-
     gc.clearRect(0, 0, width, height);
     gc.setStroke(Color.BLUE);
     gc.setLineWidth(1);
-
     gc.beginPath();
     for (int i = 0; i < samples.length; i++) {
-      // 将 short 映射到 [-1, 1]
       double sample = samples[i] / 32768.0;
       double x = (double) i / samples.length * width;
       double y = yCenter - (sample * yCenter);

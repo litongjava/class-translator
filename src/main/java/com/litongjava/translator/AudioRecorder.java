@@ -1,44 +1,41 @@
 package com.litongjava.translator;
 
 import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.IOException;
 import java.util.function.Consumer;
-
-import javax.sound.sampled.AudioFormat;
-import javax.sound.sampled.AudioSystem;
-import javax.sound.sampled.DataLine;
-import javax.sound.sampled.LineUnavailableException;
-import javax.sound.sampled.TargetDataLine;
-
+import javax.sound.sampled.*;
 import com.litongjava.translator.consts.AudioConst;
 import com.litongjava.translator.utils.AudioUtils;
 
 /**
  * 录音器实现  
- * 
- * 1. 静音的判断：当前音频的分贝低于设定的阈值（默认 -7.5 dB）时认为是静音  
- * 2. 增加了开始、暂停、停止功能，分别由外部按钮控制  
+ * 1. 判断静音：当前音频分贝低于阈值时认为静音  
+ * 2. 支持开始、暂停、停止；点击开始时保存录音文件，暂停时不保存，停止时写入文件
  */
 public class AudioRecorder {
   private static final float SAMPLE_RATE = 16000;
-  private static final int SAMPLE_SIZE = 16; // 16位单声道
-  private static final int SILENCE_DURATION = 1500; // 静音持续时间(ms)
+  private static final int SAMPLE_SIZE = 16; // 16位
+  private static final int SILENCE_DURATION = 1500; // 静音持续时间（毫秒）
 
-  // 静音阈值（单位：分贝），默认 -7.5 dB
+  // 静音阈值（单位：dB），默认 -7.5 dB
   private double silenceThreshold = AudioConst.DEFAULT_SILENCE_THRESHOLD;
   private final Consumer<byte[]> dataConsumer;
-
-  // 录音控制标志
   private volatile boolean running = false;
   private volatile boolean paused = false;
   private TargetDataLine line;
+
+  // 用于分段传输给语音识别的 ByteArrayOutputStream
+  private ByteArrayOutputStream segmentStream = new ByteArrayOutputStream();
+  // 用于保存整个录音的 ByteArrayOutputStream（用于文件保存）
+  private ByteArrayOutputStream recordingStream;
 
   public AudioRecorder(Consumer<byte[]> dataConsumer) {
     this.dataConsumer = dataConsumer;
   }
 
   /**
-   * 启动录音线程  
-   * 如果已运行，则不会重复启动
+   * 启动录音线程
    */
   public void startRecording() {
     if (running) {
@@ -46,34 +43,31 @@ public class AudioRecorder {
     }
     running = true;
     paused = false;
+    recordingStream = new ByteArrayOutputStream(); // 初始化录音保存流
     new Thread(this::recordingLoop).start();
   }
 
   /**
-   * 录音主循环  
+   * 录音主循环
    */
   private void recordingLoop() {
     try {
       AudioFormat format = new AudioFormat(SAMPLE_RATE, SAMPLE_SIZE, 1, true, false);
       DataLine.Info info = new DataLine.Info(TargetDataLine.class, format);
-
       if (!AudioSystem.isLineSupported(info)) {
-        System.err.println("Line not supported");
+        System.err.println("当前音频线路不支持");
         running = false;
         return;
       }
-
       line = (TargetDataLine) AudioSystem.getLine(info);
       line.open(format);
       line.start();
 
-      ByteArrayOutputStream out = new ByteArrayOutputStream();
       byte[] buffer = new byte[1024];
       long lastSoundTime = System.currentTimeMillis();
 
       while (running) {
         if (paused) {
-          // 暂停时，不读取数据，等待恢复
           Thread.sleep(100);
           continue;
         }
@@ -81,40 +75,42 @@ public class AudioRecorder {
         if (count > 0) {
           byte[] data = new byte[count];
           System.arraycopy(buffer, 0, data, 0, count);
-          // 将数据传给UI更新波形和状态
+          // 将数据传递给 UI 更新波形
           dataConsumer.accept(data);
-
-          // 判断是否静音
+          // 同时保存到录音文件（只有非暂停状态才写入）
+          recordingStream.write(data, 0, count);
+          // 用于判断是否静音，分段进行识别
           if (isSilence(data)) {
-            // 如果静音持续时间超过设置，则认为一句结束
             if (System.currentTimeMillis() - lastSoundTime > SILENCE_DURATION) {
-              AudioProcessor.processAudio(out.toByteArray());
-              out.reset();
+              // 语音结束时调用识别处理
+              AudioProcessor.processAudio(segmentStream.toByteArray());
+              segmentStream.reset();
             }
           } else {
-            // 有声音则更新最后声音的时间戳
             lastSoundTime = System.currentTimeMillis();
-            out.write(buffer, 0, count);
+            segmentStream.write(data, 0, count);
           }
         }
       }
-      // 录音停止时关闭数据线
+      // 录音结束后关闭音频线路
       if (line != null) {
         line.stop();
         line.close();
       }
+      // 保存录音文件
+      saveRecordingFile(format);
     } catch (LineUnavailableException | InterruptedException e) {
       e.printStackTrace();
     }
   }
 
   /**
-   * 判断一段音频数据是否为静音  
+   * 判断一段音频数据是否为静音
    */
   private boolean isSilence(byte[] buffer) {
     short[] samples = AudioUtils.convertBytesToShorts(buffer);
     if (samples.length == 0) {
-      return true; // 无数据视为静音
+      return true;
     }
     double rms = AudioUtils.calculateRMS(samples);
     double db = 20 * Math.log10(rms + 1e-12);
@@ -129,7 +125,6 @@ public class AudioRecorder {
     return this.silenceThreshold;
   }
 
-  // 控制接口
   public void pauseRecording() {
     paused = true;
   }
@@ -148,5 +143,20 @@ public class AudioRecorder {
 
   public boolean isPaused() {
     return paused;
+  }
+
+  /**
+   * 结束录音后，将录音数据保存为 WAV 文件
+   */
+  private void saveRecordingFile(AudioFormat format) {
+    byte[] audioData = recordingStream.toByteArray();
+    String filename = "recording_" + System.currentTimeMillis() + ".wav";
+    File file = new File(filename);
+    try {
+      AudioUtils.saveWavFile(audioData, format, file);
+      System.out.println("录音文件已保存至：" + file.getAbsolutePath());
+    } catch (IOException e) {
+      e.printStackTrace();
+    }
   }
 }
